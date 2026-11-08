@@ -1,0 +1,119 @@
+name: Build Linella Order Intelligence PRO APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch: # Позволяет запускать сборку вручную кнопкой "Run workflow" в GitHub
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android-apk:
+    name: Test, Build Web & Compile Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js 20 with NPM Cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 3. Setup Java JDK 21 (Required for Capacitor 6 & Gradle 8+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 4. Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 5. Cache Gradle Packages & Wrapper
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: 6. Install Dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: 7. Run Unit Tests (Vitest)
+        run: npm test
+
+      - name: 8. Build Production Web Bundle (Vite + TypeScript)
+        run: npm run build
+
+      - name: 9. Initialize or Sync Capacitor Android Project
+        run: |
+          if [ ! -d "android" ]; then
+            echo "Папка android/ не найдена. Генерируем платформу через Capacitor..."
+            npx cap add android
+          fi
+          npx cap sync android
+
+      - name: 10. Configure Android Manifest & JVM Memory for Large Excel Files
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            # Включаем увеличенный кучи памяти (largeHeap) для парсинга 50 000+ SKU в Excel
+            if ! grep -q "android:largeHeap" "$MANIFEST"; then
+              sed -i 's/<application/<application android:largeHeap="true" android:usesCleartextTraffic="true"/g' "$MANIFEST"
+            fi
+          fi
+          # Выделяем 4 ГБ RAM для Gradle Daemon при облачной компиляции
+          echo "org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8" >> android/gradle.properties
+
+      - name: 11. Grant Execute Permission for Gradlew
+        working-directory: ./android
+        run: chmod +x gradlew
+
+      - name: 12. Assemble Debug APK (Ready to Install without Keystore Setup)
+        working-directory: ./android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 13. Rename APK with Build Number & Date
+        run: |
+          BUILD_DATE=$(date +'%Y-%m-%d')
+          APK_SOURCE="android/app/build/outputs/apk/debug/app-debug.apk"
+          APK_TARGET="android/app/build/outputs/apk/debug/Linella-Order-Intelligence-PRO-v1.0.${{ github.run_number }}-${BUILD_DATE}.apk"
+          cp "$APK_SOURCE" "$APK_TARGET"
+          echo "APK_PATH=$APK_TARGET" >> $GITHUB_ENV
+          echo "APK_FILENAME=Linella-Order-Intelligence-PRO-v1.0.${{ github.run_number }}-${BUILD_DATE}.apk" >> $GITHUB_ENV
+
+      - name: 14. Upload APK to GitHub Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_FILENAME }}
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 15. Publish APK to GitHub Releases (When Tag v* is Pushed)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.APK_PATH }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
